@@ -89,7 +89,7 @@ app.post('/login', async (req, res) => {
 });
 
 // Start the server
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 80;
 app.listen(PORT, () => {
   console.log(`Backend server running at http://backend.hello-world.local.codelifted.com:${PORT}`);
 });
