@@ -2,7 +2,6 @@ const express = require('express');
 const axios = require('axios');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-require('dotenv').config(); // Load environment variables
 
 const app = express();
 
@@ -16,17 +15,25 @@ app.use(cors({
 // Function to get token for user management client
 async function getUserManagementToken() {
   try {
+    const tokenUrl = `${process.env.USER_MGMT_KEYCLOAK_URL}/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/protocol/openid-connect/token`;
+    const requestBody = {
+      client_id: process.env.USER_MGMT_KEYCLOAK_CLIENT_ID,
+      client_secret: process.env.USER_MGMT_KEYCLOAK_CLIENT_SECRET,
+      grant_type: 'client_credentials',
+    };
+
+    console.log('Token Request URL:', tokenUrl);
+    console.log('Token Request Headers:', { 'Content-Type': 'application/x-www-form-urlencoded' });
+    console.log('Token Request Body:', requestBody);
+
     const response = await axios.post(
-      `${process.env.USER_MGMT_KEYCLOAK_URL}/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/protocol/openid-connect/token`,
-      new URLSearchParams({
-        client_id: process.env.USER_MGMT_KEYCLOAK_CLIENT_ID,
-        client_secret: process.env.USER_MGMT_KEYCLOAK_CLIENT_SECRET,
-        grant_type: 'client_credentials',
-      }),
+      tokenUrl,
+      new URLSearchParams(requestBody),
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     return response.data.access_token;
   } catch (error) {
+    console.error('Token Request Error:', error.response?.data || error.message);
     throw new Error('Failed to get user management token: ' + (error.response?.data?.error_description || error.message));
   }
 }
@@ -40,28 +47,29 @@ app.post('/register', async (req, res) => {
     }
 
     const token = await getUserManagementToken();
-
+    const registerUrl = `${process.env.USER_MGMT_KEYCLOAK_URL}/admin/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/users`;
     const userData = {
       username,
       email,
       enabled: true,
       credentials: [{ type: 'password', value: password, temporary: false }],
     };
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
-    await axios.post(
-      `${process.env.USER_MGMT_KEYCLOAK_URL}/admin/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/users`,
-      userData,
-      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-    );
+    console.log('Register Request URL:', registerUrl);
+    console.log('Register Request Headers:', headers);
+    console.log('Register Request Body:', userData);
+
+    await axios.post(registerUrl, userData, { headers });
 
     res.status(201).json({ message: 'User registered successfully' });
   } catch (error) {
-    console.error('Registration error:', error.response?.data || error.message);
+    console.error('Registration Request Error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to register user' });
   }
 });
 
-// Login endpoint
+// Login endpoint (unchanged for this query)
 app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
