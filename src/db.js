@@ -1,11 +1,11 @@
 const { Pool } = require('pg');
 
 const pool = new Pool({
-  host: process.env.MAINDB_HOST,
-  port: process.env.MAINDB_PORT,
-  database: process.env.MAINDB_DATABASE,
-  user: process.env.MAINDB_USERNAME,
-  password: process.env.MAINDB_PASSWORD,
+  host: process.env.maindb_HOST,
+  port: process.env.maindb_PORT,
+  database: process.env.maindb_DATABASE,
+  user: process.env.maindb_USERNAME,
+  password: process.env.maindb_PASSWORD,
 });
 
 async function initializeSchema() {
