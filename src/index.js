@@ -41,9 +41,9 @@ async function getUserManagementToken() {
 // Registration endpoint with email verification
 app.post('/register', async (req, res) => {
   try {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password) {
-      return res.status(400).json({ error: 'Username, email, and password are required' });
+    const { username, email, password, firstName, lastName } = req.body;
+    if (!username || !email || !password || !firstName || !lastName) {
+      return res.status(400).json({ error: 'Username, email, password, first name, and last name are required' });
     }
 
     const token = await getUserManagementToken();
@@ -51,6 +51,8 @@ app.post('/register', async (req, res) => {
     const userData = {
       username,
       email,
+      firstName, // Added firstName
+      lastName,  // Added lastName
       enabled: true,
       credentials: [{ type: 'password', value: password, temporary: false }],
       requiredActions: ["VERIFY_EMAIL"]
