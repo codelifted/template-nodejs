@@ -1,0 +1,36 @@
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  host: process.env.MAINDB_HOST,
+  port: process.env.MAINDB_PORT,
+  database: process.env.MAINDB_DATABASE,
+  user: process.env.MAINDB_USERNAME,
+  password: process.env.MAINDB_PASSWORD,
+});
+
+async function initializeSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        cognito_user_id VARCHAR(255) UNIQUE NOT NULL
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        owner_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+    console.log('Database schema initialized successfully');
+  } catch (error) {
+    console.error('Error initializing schema:', error);
+    throw error; // Re-throw to halt startup if schema creation fails
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, initializeSchema };
