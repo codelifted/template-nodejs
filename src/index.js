@@ -38,7 +38,7 @@ async function getUserManagementToken() {
   }
 }
 
-// Registration endpoint
+// Registration endpoint with email verification
 app.post('/register', async (req, res) => {
   try {
     const { username, email, password } = req.body;
@@ -53,23 +53,32 @@ app.post('/register', async (req, res) => {
       email,
       enabled: true,
       credentials: [{ type: 'password', value: password, temporary: false }],
+      requiredActions: ["VERIFY_EMAIL"]
     };
+
     const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
     console.log('Register Request URL:', registerUrl);
     console.log('Register Request Headers:', headers);
     console.log('Register Request Body:', userData);
 
-    await axios.post(registerUrl, userData, { headers });
+    // Create the user
+    const createUserResponse = await axios.post(registerUrl, userData, { headers });
+    const userId = createUserResponse.headers['location'].split('/').pop(); // Extract user ID from Location header
 
-    res.status(201).json({ message: 'User registered successfully' });
+    // Trigger email verification
+    const verifyEmailUrl = `${process.env.USER_MGMT_KEYCLOAK_URL}/admin/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/users/${userId}/execute-actions-email`;
+    const verifyEmailData = ["VERIFY_EMAIL"];
+    await axios.put(verifyEmailUrl, verifyEmailData, { headers });
+
+    res.status(201).json({ message: 'User registered successfully. Please check your email to verify your account.' });
   } catch (error) {
     console.error('Registration Request Error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Failed to register user' });
   }
 });
 
-// Login endpoint (unchanged for this query)
+// Login endpoint (unchanged)
 app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
