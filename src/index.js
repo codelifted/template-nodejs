@@ -1,7 +1,10 @@
 const express = require('express');
-const axios = require('axios');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const jwksClient = require('jwks-rsa');
+const aws4 = require('aws4');
+const https = require('https');
 
 const app = express();
 
@@ -9,101 +12,73 @@ const app = express();
 app.use(bodyParser.json());
 app.use(cors({
   origin: 'https://frontend.hello-world.local.codelifted.com',
-  credentials: true
+  credentials: true,
 }));
 
-// Function to get token for user management client
-async function getUserManagementToken() {
-  try {
-    const tokenUrl = `${process.env.USER_MGMT_KEYCLOAK_URL}/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/protocol/openid-connect/token`;
-    const requestBody = {
-      client_id: process.env.USER_MGMT_KEYCLOAK_CLIENT_ID,
-      client_secret: process.env.USER_MGMT_KEYCLOAK_CLIENT_SECRET,
-      grant_type: 'client_credentials',
-    };
-
-    console.log('Token Request URL:', tokenUrl);
-    console.log('Token Request Headers:', { 'Content-Type': 'application/x-www-form-urlencoded' });
-    console.log('Token Request Body:', requestBody);
-
-    const response = await axios.post(
-      tokenUrl,
-      new URLSearchParams(requestBody),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    return response.data.access_token;
-  } catch (error) {
-    console.error('Token Request Error:', error.response?.data || error.message);
-    throw new Error('Failed to get user management token: ' + (error.response?.data?.error_description || error.message));
-  }
-}
-
-// Registration endpoint with email verification
-app.post('/register', async (req, res) => {
-  try {
-    const { username, email, password, firstName, lastName } = req.body;
-    if (!username || !email || !password || !firstName || !lastName) {
-      return res.status(400).json({ error: 'Username, email, password, first name, and last name are required' });
-    }
-
-    const token = await getUserManagementToken();
-    const registerUrl = `${process.env.USER_MGMT_KEYCLOAK_URL}/admin/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/users`;
-    const userData = {
-      username,
-      email,
-      firstName, // Added firstName
-      lastName,  // Added lastName
-      enabled: true,
-      credentials: [{ type: 'password', value: password, temporary: false }],
-      requiredActions: ["VERIFY_EMAIL"]
-    };
-
-    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
-
-    console.log('Register Request URL:', registerUrl);
-    console.log('Register Request Headers:', headers);
-    console.log('Register Request Body:', userData);
-
-    // Create the user
-    const createUserResponse = await axios.post(registerUrl, userData, { headers });
-    const userId = createUserResponse.headers['location'].split('/').pop(); // Extract user ID from Location header
-
-    // Trigger email verification
-    const verifyEmailUrl = `${process.env.USER_MGMT_KEYCLOAK_URL}/admin/realms/${process.env.USER_MGMT_KEYCLOAK_REALM}/users/${userId}/execute-actions-email`;
-    const verifyEmailData = ["VERIFY_EMAIL"];
-    await axios.put(verifyEmailUrl, verifyEmailData, { headers });
-
-    res.status(201).json({ message: 'User registered successfully. Please check your email to verify your account.' });
-  } catch (error) {
-    console.error('Registration Request Error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to register user' });
-  }
+// JWKS client for token validation
+const client = jwksClient({
+  jwksUri: `https://cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}/.well-known/jwks.json`,
 });
 
-// Login endpoint (unchanged)
-app.post('/login', async (req, res) => {
+function getKey(header, callback) {
+  client.getSigningKey(header.kid, (err, key) => {
+    if (err) return callback(err);
+    callback(null, key.getPublicKey());
+  });
+}
+
+// Token validation middleware
+function validateToken(req, res, next) {
+  const token = req.headers['authorization']?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token provided' });
+
+  jwt.verify(token, getKey, { algorithms: ['RS256'] }, (err, decoded) => {
+    if (err) return res.status(401).json({ error: 'Invalid token' });
+    req.user = decoded;
+    next();
+  });
+}
+
+// Protected endpoint
+app.get('/protected', validateToken, (req, res) => {
+  res.json({ message: 'Access granted', user: req.user });
+});
+
+// Optional: Fetch user info from Cognito using aws4
+app.get('/user-info', validateToken, async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
-    }
+    const username = req.user.sub;
+    const opts = {
+      host: `cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com`,
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': 'AWSCognitoIdentityProviderService.AdminGetUser',
+      },
+      body: JSON.stringify({ UserPoolId: process.env.COGNITO_USER_POOL_ID, Username: username }),
+    };
 
-    const response = await axios.post(
-      `${process.env.AUTH_KEYCLOAK_URL}/realms/${process.env.AUTH_KEYCLOAK_REALM}/protocol/openid-connect/token`,
-      new URLSearchParams({
-        client_id: process.env.AUTH_KEYCLOAK_CLIENT_ID,
-        client_secret: process.env.AUTH_KEYCLOAK_CLIENT_SECRET,
-        grant_type: 'password',
-        username,
-        password,
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
+    aws4.sign(opts, {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    });
 
-    res.json(response.data);
+    const response = await new Promise((resolve, reject) => {
+      const req = https.request(opts, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => resolve(JSON.parse(data)));
+      });
+      req.on('error', reject);
+      req.write(opts.body);
+      req.end();
+    });
+
+    res.json(response);
   } catch (error) {
-    console.error('Login error:', error.response?.data || error.message);
-    res.status(401).json({ error: 'Invalid credentials' });
+    console.error('Error fetching user info:', error);
+    res.status(500).json({ error: 'Failed to fetch user info' });
   }
 });
 
