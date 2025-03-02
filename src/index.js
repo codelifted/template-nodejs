@@ -8,7 +8,7 @@ const app = express();
 // Middleware
 app.use(bodyParser.json());
 app.use(cors({
-  origin: 'http://frontend.hello-world.local.codelifted.com',
+  origin: 'https://frontend.hello-world.local.codelifted.com',
   credentials: true
 }));
 
@@ -108,5 +108,5 @@ app.post('/login', async (req, res) => {
 // Start the server
 const PORT = process.env.PORT || 80;
 app.listen(PORT, () => {
-  console.log(`Backend server running at http://backend.hello-world.local.codelifted.com:${PORT}`);
+  console.log(`Backend server running at https://backend.hello-world.local.codelifted.com:${PORT}`);
 });
