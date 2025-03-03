@@ -6,6 +6,9 @@ const pool = new Pool({
   database: process.env.main_DATABASE,
   user: process.env.main_USERNAME,
   password: process.env.main_PASSWORD,
+  ssl: {
+    rejectUnauthorized: false // Allows self-signed certificates
+  }
 });
 
 async function initializeSchema() {
