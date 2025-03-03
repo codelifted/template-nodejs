@@ -183,6 +183,45 @@ app.get('/user-info', validateToken, async (req, res) => {
   }
 });
 
+app.post('/recover', async (req, res) => {
+  const { username } = req.body;
+  const opts = {
+    host: `cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com`,
+    path: '/',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-amz-json-1.1',
+      'X-Amz-Target': 'AWSCognitoIdentityProviderService.ForgotPassword',
+    },
+    body: JSON.stringify({
+      ClientId: process.env.COGNITO_CLIENT_ID,
+      Username: username,
+    }),
+  };
+
+  aws4.sign(opts, {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  });
+
+  try {
+    const response = await new Promise((resolve, reject) => {
+      const req = https.request(opts, (res) => {
+        let data = '';
+        res.on('data', (chunk) => data += chunk);
+        res.on('end', () => resolve(JSON.parse(data)));
+      });
+      req.on('error', reject);
+      req.write(opts.body);
+      req.end();
+    });
+    res.json(response);
+  } catch (error) {
+    console.error('Error in password recovery:', error);
+    res.status(500).json({ error: 'Failed to initiate password recovery' });
+  }
+});
+
 // Start the server after schema initialization
 const PORT = process.env.PORT || 80;
 initializeSchema()
