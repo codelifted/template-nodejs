@@ -362,37 +362,3 @@ initializeSchema()
     console.error('Failed to start server due to schema initialization error:', err);
     process.exit(1);
   });
-
-// Database schema (assumed in db.js)
-const db = {
-  initializeSchema: async () => {
-    const client = await pool.connect();
-    try {
-      await client.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id SERIAL PRIMARY KEY,
-          cognito_user_id VARCHAR(255) NOT NULL UNIQUE,
-          stripe_customer_id VARCHAR(255),
-          plan VARCHAR(50) DEFAULT 'free'
-        );
-        CREATE TABLE IF NOT EXISTS projects (
-          id SERIAL PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          owner_id INTEGER REFERENCES users(id)
-        );
-        CREATE TABLE IF NOT EXISTS stripe_events (
-          id SERIAL PRIMARY KEY,
-          event_type VARCHAR(255) NOT NULL,
-          event_data JSON NOT NULL,
-          user_id INTEGER REFERENCES users(id),
-          created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-      `);
-    } finally {
-      client.release();
-    }
-  },
-  pool,
-};
-
-module.exports = db;
