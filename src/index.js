@@ -412,8 +412,9 @@ app.post('/recover', async (req, res) => {
 
 // Start the server after initialization
 const PORT = process.env.PORT || 80;
-Promise.all([initializeSchema(), ensureProPlanPrice(), ensureWebhookEndpoint()])
-  .then(([_, priceId, secret]) => {
+initializeSchema()
+  .then(() => Promise.all([ensureProPlanPrice(), ensureWebhookEndpoint()]))
+  .then(([priceId, secret]) => {
     proPlanPriceId = priceId;
     webhookSecret = secret;
     app.listen(PORT, () => {
