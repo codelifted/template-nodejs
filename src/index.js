@@ -8,6 +8,21 @@ const https = require('https');
 const stripe = require('stripe')(process.env.STRIPE_API_KEY);
 const { CognitoUserPool } = require('amazon-cognito-identity-js');
 const { pool, initializeSchema } = require('./db');
+const winston = require('winston');
+
+// Configure Winston logger
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info', // Default to 'info', can be set to 'debug' via env
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message, ...meta }) => {
+      return `${timestamp} [${level.toUpperCase()}] ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ''}`;
+    })
+  ),
+  transports: [
+    new winston.transports.Console()
+  ]
+});
 
 // Global URL constants
 const WEBHOOK_URL = 'https://backend.hello-world.local.codelifted.com/stripe-webhook';
@@ -22,12 +37,14 @@ const app = express();
 
 // Middleware for webhook (raw body) - must come before bodyParser.json
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  logger.debug('Received webhook request', { headers: req.headers });
   const sig = req.headers['stripe-signature'];
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    logger.debug('Webhook event constructed', { eventType: event.type, eventId: event.id });
   } catch (err) {
-    console.error(`Webhook signature verification failed: ${err.message}`);
+    logger.error('Webhook signature verification failed', { error: err.message });
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
   const client = await pool.connect();
@@ -37,24 +54,33 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     if (customerID) {
       const res = await client.query('SELECT id FROM users WHERE stripe_customer_id = $1', [customerID]);
       if (res.rows.length > 0) userID = res.rows[0].id;
+      logger.debug('Looked up user by customer ID', { customerID, userID });
     }
     await client.query(
       'INSERT INTO stripe_events (event_type, event_data, user_id) VALUES ($1, $2, $3)',
       [event.type, JSON.stringify(event.data.object), userID]
     );
+    logger.info('Stored webhook event', { eventType: event.type, userID });
+
     switch (event.type) {
       case 'customer.subscription.created':
-        if (userID) await client.query('UPDATE users SET plan = \'pro\' WHERE id = $1', [userID]);
+        if (userID) {
+          await client.query('UPDATE users SET plan = \'pro\' WHERE id = $1', [userID]);
+          logger.info('Updated user plan to pro', { userID });
+        }
         break;
       case 'customer.subscription.deleted':
-        if (userID) await client.query('UPDATE users SET plan = \'free\' WHERE id = $1', [userID]);
+        if (userID) {
+          await client.query('UPDATE users SET plan = \'free\' WHERE id = $1', [userID]);
+          logger.info('Updated user plan to free', { userID });
+        }
         break;
       default:
-        console.log(`Unhandled event type: ${event.type}`);
+        logger.debug('Unhandled webhook event type', { eventType: event.type });
     }
     res.sendStatus(200);
   } catch (error) {
-    console.error('Error handling webhook:', error);
+    logger.error('Error handling webhook', { error: error.message });
     res.status(500).send('Internal server error');
   } finally {
     client.release();
@@ -83,11 +109,19 @@ function getKey(header, callback) {
 // Token validation middleware
 function validateToken(req, res, next) {
   const token = req.headers['authorization']?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token provided' });
+  logger.debug('Validating token', { token: token ? 'present' : 'missing' });
+  if (!token) {
+    logger.warn('No token provided in request');
+    return res.status(401).json({ error: 'No token provided' });
+  }
 
   jwt.verify(token, getKey, { algorithms: ['RS256'] }, (err, decoded) => {
-    if (err) return res.status(401).json({ error: 'Invalid token' });
+    if (err) {
+      logger.error('Invalid token', { error: err.message });
+      return res.status(401).json({ error: 'Invalid token' });
+    }
     req.user = decoded;
+    logger.debug('Token validated', { userId: decoded.sub });
     next();
   });
 }
@@ -106,6 +140,7 @@ let webhookSecret;
 async function getOrCreateUser(cognitoUserId, tokenAttributes) {
   const client = await pool.connect();
   try {
+    logger.debug('Fetching or creating user', { cognitoUserId });
     const res = await client.query('SELECT id, stripe_customer_id, plan FROM users WHERE cognito_user_id = $1', [cognitoUserId]);
     let user = res.rows[0];
 
@@ -115,6 +150,9 @@ async function getOrCreateUser(cognitoUserId, tokenAttributes) {
         [cognitoUserId]
       );
       user = insertRes.rows[0];
+      logger.info('Created new user in DB', { userId: user.id, cognitoUserId });
+    } else {
+      logger.debug('Found existing user', { userId: user.id });
     }
 
     if (!user.stripe_customer_id) {
@@ -126,11 +164,12 @@ async function getOrCreateUser(cognitoUserId, tokenAttributes) {
         [customer.id, user.id]
       );
       user.stripe_customer_id = customer.id;
+      logger.info('Created Stripe customer for user', { userId: user.id, stripeCustomerId: customer.id });
     }
 
     return user;
   } catch (error) {
-    console.error('Error in getOrCreateUser:', error);
+    logger.error('Error in getOrCreateUser', { error: error.message, cognitoUserId });
     throw error;
   } finally {
     client.release();
@@ -140,12 +179,13 @@ async function getOrCreateUser(cognitoUserId, tokenAttributes) {
 // Stripe initialization functions
 async function ensureProPlanPrice() {
   try {
+    logger.debug('Ensuring Pro Plan price');
     const prices = await stripe.prices.list({
       lookup_keys: ['pro_plan_monthly'],
       limit: 1,
     });
     if (prices.data.length > 0) {
-      console.log('Using existing Pro Plan Price ID:', prices.data[0].id);
+      logger.info('Using existing Pro Plan Price ID', { priceId: prices.data[0].id });
       return prices.data[0].id;
     }
 
@@ -153,7 +193,6 @@ async function ensureProPlanPrice() {
       name: 'Pro Plan',
       description: 'Premium subscription for advanced features',
     });
-
     const price = await stripe.prices.create({
       product: product.id,
       unit_amount: 1000,
@@ -162,10 +201,10 @@ async function ensureProPlanPrice() {
       lookup_key: 'pro_plan_monthly',
     });
 
-    console.log('Created Pro Plan Price ID:', price.id);
+    logger.info('Created Pro Plan Price ID', { priceId: price.id });
     return price.id;
   } catch (error) {
-    console.error('Error ensuring Pro Plan price:', error);
+    logger.error('Error ensuring Pro Plan price', { error: error.message });
     throw error;
   }
 }
@@ -173,9 +212,10 @@ async function ensureProPlanPrice() {
 async function ensureWebhookEndpoint() {
   const client = await pool.connect();
   try {
+    logger.debug('Ensuring webhook endpoint');
     const res = await client.query('SELECT stripe_webhook_secret FROM config WHERE key = $1', ['stripe_webhook_secret']);
     if (res.rows.length > 0) {
-      console.log('Using stored webhook secret from DB');
+      logger.info('Using stored webhook secret from DB');
       return res.rows[0].stripe_webhook_secret;
     }
 
@@ -183,7 +223,7 @@ async function ensureWebhookEndpoint() {
     const existing = endpoints.data.find(e => e.url === WEBHOOK_URL);
     if (existing) {
       await stripe.webhookEndpoints.del(existing.id);
-      console.log('Deleted existing webhook endpoint:', existing.id);
+      logger.info('Deleted existing webhook endpoint', { endpointId: existing.id });
     }
 
     const webhook = await stripe.webhookEndpoints.create({
@@ -196,7 +236,7 @@ async function ensureWebhookEndpoint() {
     });
 
     const secret = webhook.secret;
-    console.log('Created new webhook endpoint:', webhook.id, 'with secret:', secret);
+    logger.info('Created new webhook endpoint', { endpointId: webhook.id, secret });
 
     await client.query(
       'INSERT INTO config (key, stripe_webhook_secret) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET stripe_webhook_secret = $2',
@@ -204,7 +244,7 @@ async function ensureWebhookEndpoint() {
     );
     return secret;
   } catch (error) {
-    console.error('Error ensuring webhook endpoint:', error);
+    logger.error('Error ensuring webhook endpoint', { error: error.message });
     throw error;
   } finally {
     client.release();
@@ -214,38 +254,43 @@ async function ensureWebhookEndpoint() {
 // Endpoints
 app.get('/me', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /me request', { userId: req.user.sub });
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId, req.user);
     res.json({ id: user.id, cognitoUserId, plan: user.plan });
   } catch (error) {
-    console.error('Error in /me:', error);
+    logger.error('Error in /me', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/set-plan', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /set-plan request', { userId: req.user.sub, body: req.body });
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId, req.user);
     const { plan } = req.body;
     if (!['free', 'pro'].includes(plan)) {
+      logger.warn('Invalid plan specified', { plan });
       return res.status(400).json({ error: 'Invalid plan' });
     }
     const client = await pool.connect();
     try {
       await client.query('UPDATE users SET plan = $1 WHERE id = $2', [plan, user.id]);
+      logger.info('Plan updated successfully', { userId: user.id, plan });
       res.json({ message: 'Plan set successfully' });
     } finally {
       client.release();
     }
   } catch (error) {
-    console.error('Error in /set-plan:', error);
+    logger.error('Error in /set-plan', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/stripe-checkout', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /stripe-checkout request', { userId: req.user.sub });
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId, req.user);
     const session = await stripe.checkout.sessions.create({
@@ -258,78 +303,96 @@ app.post('/stripe-checkout', validateToken, async (req, res) => {
       success_url: CHECKOUT_SUCCESS_URL,
       cancel_url: CHECKOUT_CANCEL_URL,
     });
+    logger.info('Created Stripe Checkout session', { sessionId: session.id, userId: user.id });
     res.json({ url: session.url });
   } catch (error) {
-    console.error('Error in /stripe-checkout:', error);
+    logger.error('Error in /stripe-checkout', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.get('/projects', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /projects GET request', { userId: req.user.sub });
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId, req.user);
     const client = await pool.connect();
     try {
       const resProjects = await client.query('SELECT id, name FROM projects WHERE owner_id = $1', [user.id]);
+      logger.debug('Retrieved projects', { userId: user.id, projectCount: resProjects.rows.length });
       res.json({ projects: resProjects.rows });
     } finally {
       client.release();
     }
   } catch (error) {
-    console.error('Error in /projects:', error);
+    logger.error('Error in /projects', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/projects', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /projects POST request', { userId: req.user.sub, body: req.body });
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId, req.user);
     const { name } = req.body;
-    if (!name) return res.status(400).json({ error: 'Project name is required' });
+    if (!name) {
+      logger.warn('Project name missing in request');
+      return res.status(400).json({ error: 'Project name is required' });
+    }
     const client = await pool.connect();
     try {
       const insertRes = await client.query(
         'INSERT INTO projects (name, owner_id) VALUES ($1, $2) RETURNING id, name',
         [name, user.id]
       );
+      logger.info('Created new project', { projectId: insertRes.rows[0].id, name });
       res.status(201).json({ project: insertRes.rows[0] });
     } finally {
       client.release();
     }
   } catch (error) {
-    console.error('Error in /projects POST:', error);
+    logger.error('Error in /projects POST', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.delete('/projects/:id', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /projects DELETE request', { userId: req.user.sub, projectId: req.params.id });
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId, req.user);
     const client = await pool.connect();
     try {
       const resProject = await client.query('SELECT owner_id FROM projects WHERE id = $1', [req.params.id]);
-      if (resProject.rows.length === 0) return res.status(404).json({ error: 'Project not found' });
-      if (resProject.rows[0].owner_id !== user.id) return res.status(403).json({ error: 'Forbidden' });
+      if (resProject.rows.length === 0) {
+        logger.warn('Project not found', { projectId: req.params.id });
+        return res.status(404).json({ error: 'Project not found' });
+      }
+      if (resProject.rows[0].owner_id !== user.id) {
+        logger.warn('Forbidden project deletion attempt', { userId: user.id, projectId: req.params.id });
+        return res.status(403).json({ error: 'Forbidden' });
+      }
       await client.query('DELETE FROM projects WHERE id = $1', [req.params.id]);
+      logger.info('Deleted project', { projectId: req.params.id, userId: user.id });
       res.json({ message: 'Project deleted' });
     } finally {
       client.release();
     }
   } catch (error) {
-    console.error('Error in /projects/:id DELETE:', error);
+    logger.error('Error in /projects/:id DELETE', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.get('/protected', validateToken, (req, res) => {
+  logger.debug('Handling /protected request', { userId: req.user.sub });
   res.json({ message: 'Access granted', user: req.user });
 });
 
 app.get('/user-info', validateToken, async (req, res) => {
   try {
+    logger.debug('Handling /user-info request', { userId: req.user.sub });
     const username = req.user.sub;
     const opts = {
       host: COGNITO_IDP_HOST,
@@ -352,30 +415,32 @@ app.get('/user-info', validateToken, async (req, res) => {
       req.write(opts.body);
       req.end();
     });
+    logger.debug('Fetched user info from Cognito', { userId: username });
     res.json(response);
   } catch (error) {
-    console.error('Error fetching user info:', error);
+    logger.error('Error fetching user info', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch user info' });
   }
 });
 
 app.post('/recover', async (req, res) => {
-  const { username } = req.body;
-  const opts = {
-    host: COGNITO_IDP_HOST,
-    path: '/',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-amz-json-1.1',
-      'X-Amz-Target': 'AWSCognitoIdentityProviderService.ForgotPassword',
-    },
-    body: JSON.stringify({
-      ClientId: process.env.COGNITO_CLIENT_ID,
-      Username: username,
-    }),
-  };
-  aws4.sign(opts, { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
   try {
+    logger.debug('Handling /recover request', { body: req.body });
+    const { username } = req.body;
+    const opts = {
+      host: COGNITO_IDP_HOST,
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': 'AWSCognitoIdentityProviderService.ForgotPassword',
+      },
+      body: JSON.stringify({
+        ClientId: process.env.COGNITO_CLIENT_ID,
+        Username: username,
+      }),
+    };
+    aws4.sign(opts, { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
     const response = await new Promise((resolve, reject) => {
       const req = https.request(opts, (res) => {
         let data = '';
@@ -386,9 +451,10 @@ app.post('/recover', async (req, res) => {
       req.write(opts.body);
       req.end();
     });
+    logger.info('Password recovery initiated', { username });
     res.json(response);
   } catch (error) {
-    console.error('Error in password recovery:', error);
+    logger.error('Error in password recovery', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -396,15 +462,18 @@ app.post('/recover', async (req, res) => {
 // Start the server after initialization
 const PORT = process.env.PORT || 80;
 initializeSchema()
-  .then(() => Promise.all([ensureProPlanPrice(), ensureWebhookEndpoint()]))
+  .then(() => {
+    logger.info('Database schema initialized successfully');
+    return Promise.all([ensureProPlanPrice(), ensureWebhookEndpoint()]);
+  })
   .then(([priceId, secret]) => {
     proPlanPriceId = priceId;
     webhookSecret = secret;
     app.listen(PORT, () => {
-      console.log(`Backend server running at ${SERVER_BASE_URL}:${PORT}`);
+      logger.info(`Backend server running at ${SERVER_BASE_URL}:${PORT}`);
     });
   })
   .catch((err) => {
-    console.error('Failed to start server due to initialization error:', err);
+    logger.error('Failed to start server due to initialization error', { error: err.message });
     process.exit(1);
   });
