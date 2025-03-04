@@ -6,7 +6,7 @@ const jwksClient = require('jwks-rsa');
 const aws4 = require('aws4');
 const https = require('https');
 const stripe = require('stripe')(process.env.STRIPE_API_KEY);
-const { CognitoUserPool, CognitoUser } = require('amazon-cognito-identity-js');
+const { CognitoUserPool } = require('amazon-cognito-identity-js');
 const { pool, initializeSchema } = require('./db');
 
 // Global URL constants
@@ -51,7 +51,7 @@ function validateToken(req, res, next) {
   });
 }
 
-// Cognito User Pool
+// Cognito User Pool (kept for potential future use, but not used here)
 const userPool = new CognitoUserPool({
   UserPoolId: process.env.COGNITO_USER_POOL_ID,
   ClientId: process.env.COGNITO_CLIENT_ID,
@@ -61,30 +61,14 @@ const userPool = new CognitoUserPool({
 let proPlanPriceId;
 let webhookSecret;
 
-// Helper function to get user attributes from Cognito
-async function getUserAttributes(cognitoUserId) {
-  const user = new CognitoUser({ Username: cognitoUserId, Pool: userPool });
-  return new Promise((resolve, reject) => {
-    user.getUserAttributes((err, attributes) => {
-      if (err) reject(err);
-      else {
-        const attrMap = {};
-        attributes.forEach(attr => attrMap[attr.getName()] = attr.getValue());
-        resolve(attrMap);
-      }
-    });
-  });
-}
-
-// Helper function to get or create user, ensuring a Stripe customer ID
-async function getOrCreateUser(cognitoUserId) {
+// Helper function to get or create user, using token attributes
+async function getOrCreateUser(cognitoUserId, tokenAttributes) {
   const client = await pool.connect();
   try {
     const res = await client.query('SELECT id, stripe_customer_id, plan FROM users WHERE cognito_user_id = $1', [cognitoUserId]);
     let user = res.rows[0];
 
     if (!user) {
-      // New user: create in DB
       const insertRes = await client.query(
         'INSERT INTO users (cognito_user_id) VALUES ($1) RETURNING id, stripe_customer_id, plan',
         [cognitoUserId]
@@ -92,11 +76,9 @@ async function getOrCreateUser(cognitoUserId) {
       user = insertRes.rows[0];
     }
 
-    // If no Stripe customer ID, create one
     if (!user.stripe_customer_id) {
-      const attributes = await getUserAttributes(cognitoUserId);
-      const email = attributes.email;
-      const name = `${attributes.given_name || ''} ${attributes.family_name || ''}`.trim() || 'Unnamed User';
+      const email = tokenAttributes.email || 'unknown@example.com'; // Fallback if email isn't in token
+      const name = `${tokenAttributes.given_name || ''} ${tokenAttributes.family_name || ''}`.trim() || 'Unnamed User';
       const customer = await stripe.customers.create({ email, name });
       await client.query(
         'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
@@ -133,7 +115,7 @@ async function ensureProPlanPrice() {
 
     const price = await stripe.prices.create({
       product: product.id,
-      unit_amount: 1000, // $10.00 in cents (adjust as needed)
+      unit_amount: 1000,
       currency: 'usd',
       recurring: { interval: 'month' },
       lookup_key: 'pro_plan_monthly',
@@ -192,7 +174,7 @@ async function ensureWebhookEndpoint() {
 app.get('/me', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
-    const user = await getOrCreateUser(cognitoUserId);
+    const user = await getOrCreateUser(cognitoUserId, req.user);
     res.json({ id: user.id, cognitoUserId, plan: user.plan });
   } catch (error) {
     console.error('Error in /me:', error);
@@ -203,7 +185,7 @@ app.get('/me', validateToken, async (req, res) => {
 app.post('/set-plan', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
-    const user = await getOrCreateUser(cognitoUserId);
+    const user = await getOrCreateUser(cognitoUserId, req.user);
     const { plan } = req.body;
     if (!['free', 'pro'].includes(plan)) {
       return res.status(400).json({ error: 'Invalid plan' });
@@ -224,7 +206,7 @@ app.post('/set-plan', validateToken, async (req, res) => {
 app.post('/stripe-checkout', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
-    const user = await getOrCreateUser(cognitoUserId);
+    const user = await getOrCreateUser(cognitoUserId, req.user);
     const session = await stripe.checkout.sessions.create({
       customer: user.stripe_customer_id,
       line_items: [{
@@ -285,7 +267,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 app.get('/projects', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
-    const user = await getOrCreateUser(cognitoUserId);
+    const user = await getOrCreateUser(cognitoUserId, req.user);
     const client = await pool.connect();
     try {
       const resProjects = await client.query('SELECT id, name FROM projects WHERE owner_id = $1', [user.id]);
@@ -302,7 +284,7 @@ app.get('/projects', validateToken, async (req, res) => {
 app.post('/projects', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
-    const user = await getOrCreateUser(cognitoUserId);
+    const user = await getOrCreateUser(cognitoUserId, req.user);
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: 'Project name is required' });
     const client = await pool.connect();
@@ -324,7 +306,7 @@ app.post('/projects', validateToken, async (req, res) => {
 app.delete('/projects/:id', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
-    const user = await getOrCreateUser(cognitoUserId);
+    const user = await getOrCreateUser(cognitoUserId, req.user);
     const client = await pool.connect();
     try {
       const resProject = await client.query('SELECT owner_id FROM projects WHERE id = $1', [req.params.id]);
@@ -406,7 +388,7 @@ app.post('/recover', async (req, res) => {
     res.json(response);
   } catch (error) {
     console.error('Error in password recovery:', error);
-    res.status(500).json({ error: 'Failed to initiate password recovery' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
