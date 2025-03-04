@@ -20,7 +20,48 @@ const COGNITO_IDP_HOST = `cognito-idp.${process.env.COGNITO_REGION}.amazonaws.co
 
 const app = express();
 
-// Middleware
+// Middleware for webhook (raw body) - must come before bodyParser.json
+app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error(`Webhook signature verification failed: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  const client = await pool.connect();
+  try {
+    const customerID = event.data.object.customer;
+    let userID = null;
+    if (customerID) {
+      const res = await client.query('SELECT id FROM users WHERE stripe_customer_id = $1', [customerID]);
+      if (res.rows.length > 0) userID = res.rows[0].id;
+    }
+    await client.query(
+      'INSERT INTO stripe_events (event_type, event_data, user_id) VALUES ($1, $2, $3)',
+      [event.type, JSON.stringify(event.data.object), userID]
+    );
+    switch (event.type) {
+      case 'customer.subscription.created':
+        if (userID) await client.query('UPDATE users SET plan = \'pro\' WHERE id = $1', [userID]);
+        break;
+      case 'customer.subscription.deleted':
+        if (userID) await client.query('UPDATE users SET plan = \'free\' WHERE id = $1', [userID]);
+        break;
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('Error handling webhook:', error);
+    res.status(500).send('Internal server error');
+  } finally {
+    client.release();
+  }
+});
+
+// General middleware (after webhook route)
 app.use(bodyParser.json());
 app.use(cors({
   origin: CORS_ORIGIN,
@@ -51,7 +92,7 @@ function validateToken(req, res, next) {
   });
 }
 
-// Cognito User Pool (kept for potential future use, but not used here)
+// Cognito User Pool (kept for potential future use)
 const userPool = new CognitoUserPool({
   UserPoolId: process.env.COGNITO_USER_POOL_ID,
   ClientId: process.env.COGNITO_CLIENT_ID,
@@ -77,7 +118,7 @@ async function getOrCreateUser(cognitoUserId, tokenAttributes) {
     }
 
     if (!user.stripe_customer_id) {
-      const email = tokenAttributes.email || 'unknown@example.com'; // Fallback if email isn't in token
+      const email = tokenAttributes.email || 'unknown@example.com';
       const name = `${tokenAttributes.given_name || ''} ${tokenAttributes.family_name || ''}`.trim() || 'Unnamed User';
       const customer = await stripe.customers.create({ email, name });
       await client.query(
@@ -221,46 +262,6 @@ app.post('/stripe-checkout', validateToken, async (req, res) => {
   } catch (error) {
     console.error('Error in /stripe-checkout:', error);
     res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-  } catch (err) {
-    console.error(`Webhook signature verification failed: ${err.message}`);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-  const client = await pool.connect();
-  try {
-    const customerID = event.data.object.customer;
-    let userID = null;
-    if (customerID) {
-      const res = await client.query('SELECT id FROM users WHERE stripe_customer_id = $1', [customerID]);
-      if (res.rows.length > 0) userID = res.rows[0].id;
-    }
-    await client.query(
-      'INSERT INTO stripe_events (event_type, event_data, user_id) VALUES ($1, $2, $3)',
-      [event.type, JSON.stringify(event.data.object), userID]
-    );
-    switch (event.type) {
-      case 'customer.subscription.created':
-        if (userID) await client.query('UPDATE users SET plan = \'pro\' WHERE id = $1', [userID]);
-        break;
-      case 'customer.subscription.deleted':
-        if (userID) await client.query('UPDATE users SET plan = \'free\' WHERE id = $1', [userID]);
-        break;
-      default:
-        console.log(`Unhandled event type: ${event.type}`);
-    }
-    res.sendStatus(200);
-  } catch (error) {
-    console.error('Error handling webhook:', error);
-    res.status(500).send('Internal server error');
-  } finally {
-    client.release();
   }
 });
 
