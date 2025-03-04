@@ -76,28 +76,35 @@ async function getUserAttributes(cognitoUserId) {
   });
 }
 
-// Helper function to get or create user
+// Helper function to get or create user, ensuring a Stripe customer ID
 async function getOrCreateUser(cognitoUserId) {
   const client = await pool.connect();
   try {
     const res = await client.query('SELECT id, stripe_customer_id, plan FROM users WHERE cognito_user_id = $1', [cognitoUserId]);
-    if (res.rows.length > 0) {
-      return res.rows[0];
+    let user = res.rows[0];
+
+    if (!user) {
+      // New user: create in DB
+      const insertRes = await client.query(
+        'INSERT INTO users (cognito_user_id) VALUES ($1) RETURNING id, stripe_customer_id, plan',
+        [cognitoUserId]
+      );
+      user = insertRes.rows[0];
     }
-    const insertRes = await client.query(
-      'INSERT INTO users (cognito_user_id) VALUES ($1) RETURNING id, stripe_customer_id, plan',
-      [cognitoUserId]
-    );
-    const user = insertRes.rows[0];
-    const attributes = await getUserAttributes(cognitoUserId);
-    const email = attributes.email;
-    const name = `${attributes.given_name} ${attributes.family_name}`;
-    const customer = await stripe.customers.create({ email, name });
-    await client.query(
-      'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
-      [customer.id, user.id]
-    );
-    user.stripe_customer_id = customer.id;
+
+    // If no Stripe customer ID, create one
+    if (!user.stripe_customer_id) {
+      const attributes = await getUserAttributes(cognitoUserId);
+      const email = attributes.email;
+      const name = `${attributes.given_name || ''} ${attributes.family_name || ''}`.trim() || 'Unnamed User';
+      const customer = await stripe.customers.create({ email, name });
+      await client.query(
+        'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
+        [customer.id, user.id]
+      );
+      user.stripe_customer_id = customer.id;
+    }
+
     return user;
   } catch (error) {
     console.error('Error in getOrCreateUser:', error);
@@ -143,14 +150,12 @@ async function ensureProPlanPrice() {
 async function ensureWebhookEndpoint() {
   const client = await pool.connect();
   try {
-    // Check if secret is stored in DB
     const res = await client.query('SELECT stripe_webhook_secret FROM config WHERE key = $1', ['stripe_webhook_secret']);
     if (res.rows.length > 0) {
       console.log('Using stored webhook secret from DB');
       return res.rows[0].stripe_webhook_secret;
     }
 
-    // Check if webhook exists in Stripe and delete it if it does
     const endpoints = await stripe.webhookEndpoints.list({ limit: 10 });
     const existing = endpoints.data.find(e => e.url === WEBHOOK_URL);
     if (existing) {
@@ -158,7 +163,6 @@ async function ensureWebhookEndpoint() {
       console.log('Deleted existing webhook endpoint:', existing.id);
     }
 
-    // Create new webhook
     const webhook = await stripe.webhookEndpoints.create({
       url: WEBHOOK_URL,
       enabled_events: [
@@ -171,7 +175,6 @@ async function ensureWebhookEndpoint() {
     const secret = webhook.secret;
     console.log('Created new webhook endpoint:', webhook.id, 'with secret:', secret);
 
-    // Store the secret in DB
     await client.query(
       'INSERT INTO config (key, stripe_webhook_secret) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET stripe_webhook_secret = $2',
       ['stripe_webhook_secret', secret]
@@ -222,9 +225,6 @@ app.post('/stripe-checkout', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId);
-    if (!user.stripe_customer_id) {
-      throw new Error('User does not have a Stripe customer ID');
-    }
     const session = await stripe.checkout.sessions.create({
       customer: user.stripe_customer_id,
       line_items: [{
