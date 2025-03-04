@@ -95,9 +95,70 @@ async function getOrCreateUser(cognitoUserId) {
   }
 }
 
+// Stripe initialization functions
+async function ensureProPlanPrice() {
+  try {
+    const prices = await stripe.prices.list({
+      lookup_keys: ['pro_plan_monthly'],
+      limit: 1,
+    });
+    if (prices.data.length > 0) {
+      console.log('Found existing Pro Plan Price ID:', prices.data[0].id);
+      return prices.data[0].id;
+    }
+
+    const product = await stripe.products.create({
+      name: 'Pro Plan',
+      description: 'Premium subscription for advanced features',
+    });
+
+    const price = await stripe.prices.create({
+      product: product.id,
+      unit_amount: 1000, // $10.00 in cents
+      currency: 'usd',
+      recurring: { interval: 'month' },
+      lookup_key: 'pro_plan_monthly',
+    });
+
+    console.log('Created Pro Plan Price ID:', price.id);
+    return price.id;
+  } catch (error) {
+    console.error('Error ensuring Pro Plan price:', error);
+    throw error;
+  }
+}
+
+async function ensureWebhookEndpoint() {
+  try {
+    const endpoints = await stripe.webhookEndpoints.list({ limit: 10 });
+    const webhookUrl = 'https://backend.hello-world.local.codelifted.com/stripe-webhook';
+    const existing = endpoints.data.find(e => e.url === webhookUrl);
+
+    if (existing) {
+      console.log('Found existing webhook endpoint:', existing.id);
+      // Note: Secret isn't retrievable here; assume it's already set or manually configured
+      return process.env.STRIPEWEBHOOK_SIGNING_SECRET || null;
+    }
+
+    const webhook = await stripe.webhookEndpoints.create({
+      url: webhookUrl,
+      enabled_events: [
+        'customer.subscription.created',
+        'customer.subscription.deleted',
+      ],
+      description: 'Webhook for Hello World backend',
+    });
+
+    console.log('Created webhook endpoint with Secret:', webhook.secret);
+    return webhook.secret;
+  } catch (error) {
+    console.error('Error ensuring webhook endpoint:', error);
+    throw error;
+  }
+}
+
 // Endpoints
 
-// /me: Get or create user info, including plan
 app.get('/me', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
@@ -109,7 +170,6 @@ app.get('/me', validateToken, async (req, res) => {
   }
 });
 
-// /set-plan: Set user's plan
 app.post('/set-plan', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
@@ -131,7 +191,6 @@ app.post('/set-plan', validateToken, async (req, res) => {
   }
 });
 
-// /stripe-checkout: Initiate Stripe checkout for pro plan
 app.post('/stripe-checkout', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
@@ -156,7 +215,6 @@ app.post('/stripe-checkout', validateToken, async (req, res) => {
   }
 });
 
-// /stripe-webhook: Handle Stripe webhook events
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -197,19 +255,14 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
   }
 });
 
-// Existing endpoints (unchanged for brevity, but included for completeness)
-
-// /projects: List user's projects
+// Other endpoints (unchanged for brevity)
 app.get('/projects', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId);
     const client = await pool.connect();
     try {
-      const resProjects = await client.query(
-        'SELECT id, name FROM projects WHERE owner_id = $1',
-        [user.id]
-      );
+      const resProjects = await client.query('SELECT id, name FROM projects WHERE owner_id = $1', [user.id]);
       res.json({ projects: resProjects.rows });
     } finally {
       client.release();
@@ -220,7 +273,6 @@ app.get('/projects', validateToken, async (req, res) => {
   }
 });
 
-// /projects: Create a project
 app.post('/projects', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
@@ -243,17 +295,13 @@ app.post('/projects', validateToken, async (req, res) => {
   }
 });
 
-// /projects/:id: Delete a project
 app.delete('/projects/:id', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
     const user = await getOrCreateUser(cognitoUserId);
     const client = await pool.connect();
     try {
-      const resProject = await client.query(
-        'SELECT owner_id FROM projects WHERE id = $1',
-        [req.params.id]
-      );
+      const resProject = await client.query('SELECT owner_id FROM projects WHERE id = $1', [req.params.id]);
       if (resProject.rows.length === 0) return res.status(404).json({ error: 'Project not found' });
       if (resProject.rows[0].owner_id !== user.id) return res.status(403).json({ error: 'Forbidden' });
       await client.query('DELETE FROM projects WHERE id = $1', [req.params.id]);
@@ -267,12 +315,10 @@ app.delete('/projects/:id', validateToken, async (req, res) => {
   }
 });
 
-// /protected: Protected route example
 app.get('/protected', validateToken, (req, res) => {
   res.json({ message: 'Access granted', user: req.user });
 });
 
-// /user-info: Fetch Cognito user info
 app.get('/user-info', validateToken, async (req, res) => {
   try {
     const username = req.user.sub;
@@ -310,7 +356,6 @@ app.get('/user-info', validateToken, async (req, res) => {
   }
 });
 
-// /recover: Password recovery
 app.post('/recover', async (req, res) => {
   const { username } = req.body;
   const opts = {
@@ -350,15 +395,21 @@ app.post('/recover', async (req, res) => {
   }
 });
 
-// Start the server after schema initialization
+// Start the server after initialization
 const PORT = process.env.PORT || 80;
-initializeSchema()
-  .then(() => {
+Promise.all([initializeSchema(), ensureProPlanPrice(), ensureWebhookEndpoint()])
+  .then(([_, priceId, webhookSecret]) => {
+    process.env.STRIPE_PRO_PLAN_PRICE_ID = priceId;
+    if (webhookSecret) {
+      process.env.STRIPEWEBHOOK_SIGNING_SECRET = webhookSecret;
+    } else if (!process.env.STRIPEWEBHOOK_SIGNING_SECRET) {
+      throw new Error('STRIPEWEBHOOK_SIGNING_SECRET not set and could not be retrieved');
+    }
     app.listen(PORT, () => {
       console.log(`Backend server running at https://backend.hello-world.local.codelifted.com:${PORT}`);
     });
   })
   .catch((err) => {
-    console.error('Failed to start server due to schema initialization error:', err);
+    console.error('Failed to start server due to initialization error:', err);
     process.exit(1);
   });
