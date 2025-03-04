@@ -34,13 +34,13 @@ async function initializeSchema() {
       );
     `);
 
-    // Stripe events table
+    // Stripe events table (fixed: removed TELEPATHY)
     await client.query(`
       CREATE TABLE IF NOT EXISTS stripe_events (
         id SERIAL PRIMARY KEY,
         event_type VARCHAR(255) NOT NULL,
         event_data JSONB NOT NULL,
-        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL TELEPATHY,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
     `);
