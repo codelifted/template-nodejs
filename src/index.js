@@ -9,18 +9,27 @@ const stripe = require('stripe')(process.env.STRIPE_API_KEY);
 const { CognitoUserPool, CognitoUser } = require('amazon-cognito-identity-js');
 const { pool, initializeSchema } = require('./db');
 
+// Global URL constants
+const WEBHOOK_URL = 'https://backend.hello-world.local.codelifted.com/stripe-webhook';
+const CHECKOUT_SUCCESS_URL = 'https://frontend.hello-world.local.codelifted.com/dashboard';
+const CHECKOUT_CANCEL_URL = 'https://frontend.hello-world.local.codelifted.com/pricing';
+const SERVER_BASE_URL = 'https://backend.hello-world.local.codelifted.com';
+const CORS_ORIGIN = 'https://frontend.hello-world.local.codelifted.com';
+const COGNITO_JWKS_URL = `https://cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}/.well-known/jwks.json`;
+const COGNITO_IDP_HOST = `cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com`;
+
 const app = express();
 
 // Middleware
 app.use(bodyParser.json());
 app.use(cors({
-  origin: 'https://frontend.hello-world.local.codelifted.com',
+  origin: CORS_ORIGIN,
   credentials: true,
 }));
 
 // JWKS client for token validation
 const client = jwksClient({
-  jwksUri: `https://cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}/.well-known/jwks.json`,
+  jwksUri: COGNITO_JWKS_URL,
 });
 
 function getKey(header, callback) {
@@ -47,6 +56,10 @@ const userPool = new CognitoUserPool({
   UserPoolId: process.env.COGNITO_USER_POOL_ID,
   ClientId: process.env.COGNITO_CLIENT_ID,
 });
+
+// Global variables for Stripe configuration
+let proPlanPriceId;
+let webhookSecret;
 
 // Helper function to get user attributes from Cognito
 async function getUserAttributes(cognitoUserId) {
@@ -76,7 +89,6 @@ async function getOrCreateUser(cognitoUserId) {
       [cognitoUserId]
     );
     const user = insertRes.rows[0];
-    // Create Stripe customer for new user
     const attributes = await getUserAttributes(cognitoUserId);
     const email = attributes.email;
     const name = `${attributes.given_name} ${attributes.family_name}`;
@@ -103,7 +115,7 @@ async function ensureProPlanPrice() {
       limit: 1,
     });
     if (prices.data.length > 0) {
-      console.log('Found existing Pro Plan Price ID:', prices.data[0].id);
+      console.log('Using existing Pro Plan Price ID:', prices.data[0].id);
       return prices.data[0].id;
     }
 
@@ -114,7 +126,7 @@ async function ensureProPlanPrice() {
 
     const price = await stripe.prices.create({
       product: product.id,
-      unit_amount: 1000, // $10.00 in cents
+      unit_amount: 1000, // $10.00 in cents (adjust as needed)
       currency: 'usd',
       recurring: { interval: 'month' },
       lookup_key: 'pro_plan_monthly',
@@ -129,19 +141,26 @@ async function ensureProPlanPrice() {
 }
 
 async function ensureWebhookEndpoint() {
+  const client = await pool.connect();
   try {
-    const endpoints = await stripe.webhookEndpoints.list({ limit: 10 });
-    const webhookUrl = 'https://backend.hello-world.local.codelifted.com/stripe-webhook';
-    const existing = endpoints.data.find(e => e.url === webhookUrl);
-
-    if (existing) {
-      console.log('Found existing webhook endpoint:', existing.id);
-      // Note: Secret isn't retrievable here; assume it's already set or manually configured
-      return process.env.STRIPEWEBHOOK_SIGNING_SECRET || null;
+    // Check if secret is stored in DB
+    const res = await client.query('SELECT stripe_webhook_secret FROM config WHERE key = $1', ['stripe_webhook_secret']);
+    if (res.rows.length > 0) {
+      console.log('Using stored webhook secret from DB');
+      return res.rows[0].stripe_webhook_secret;
     }
 
+    // Check if webhook exists in Stripe and delete it if it does
+    const endpoints = await stripe.webhookEndpoints.list({ limit: 10 });
+    const existing = endpoints.data.find(e => e.url === WEBHOOK_URL);
+    if (existing) {
+      await stripe.webhookEndpoints.del(existing.id);
+      console.log('Deleted existing webhook endpoint:', existing.id);
+    }
+
+    // Create new webhook
     const webhook = await stripe.webhookEndpoints.create({
-      url: webhookUrl,
+      url: WEBHOOK_URL,
       enabled_events: [
         'customer.subscription.created',
         'customer.subscription.deleted',
@@ -149,16 +168,24 @@ async function ensureWebhookEndpoint() {
       description: 'Webhook for Hello World backend',
     });
 
-    console.log('Created webhook endpoint with Secret:', webhook.secret);
-    return webhook.secret;
+    const secret = webhook.secret;
+    console.log('Created new webhook endpoint:', webhook.id, 'with secret:', secret);
+
+    // Store the secret in DB
+    await client.query(
+      'INSERT INTO config (key, stripe_webhook_secret) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET stripe_webhook_secret = $2',
+      ['stripe_webhook_secret', secret]
+    );
+    return secret;
   } catch (error) {
     console.error('Error ensuring webhook endpoint:', error);
     throw error;
+  } finally {
+    client.release();
   }
 }
 
 // Endpoints
-
 app.get('/me', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
@@ -201,12 +228,12 @@ app.post('/stripe-checkout', validateToken, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       customer: user.stripe_customer_id,
       line_items: [{
-        price: process.env.STRIPE_PRO_PLAN_PRICE_ID,
+        price: proPlanPriceId,
         quantity: 1,
       }],
       mode: 'subscription',
-      success_url: 'https://frontend.hello-world.local.codelifted.com/dashboard',
-      cancel_url: 'https://frontend.hello-world.local.codelifted.com/pricing',
+      success_url: CHECKOUT_SUCCESS_URL,
+      cancel_url: CHECKOUT_CANCEL_URL,
     });
     res.json({ url: session.url });
   } catch (error) {
@@ -219,7 +246,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
   const sig = req.headers['stripe-signature'];
   let event;
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPEWEBHOOK_SIGNING_SECRET);
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
     console.error(`Webhook signature verification failed: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -255,7 +282,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
   }
 });
 
-// Other endpoints (unchanged for brevity)
 app.get('/projects', validateToken, async (req, res) => {
   try {
     const cognitoUserId = req.user.sub;
@@ -323,7 +349,7 @@ app.get('/user-info', validateToken, async (req, res) => {
   try {
     const username = req.user.sub;
     const opts = {
-      host: `cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com`,
+      host: COGNITO_IDP_HOST,
       path: '/',
       method: 'POST',
       headers: {
@@ -332,12 +358,7 @@ app.get('/user-info', validateToken, async (req, res) => {
       },
       body: JSON.stringify({ UserPoolId: process.env.COGNITO_USER_POOL_ID, Username: username }),
     };
-
-    aws4.sign(opts, {
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    });
-
+    aws4.sign(opts, { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
     const response = await new Promise((resolve, reject) => {
       const req = https.request(opts, (res) => {
         let data = '';
@@ -348,7 +369,6 @@ app.get('/user-info', validateToken, async (req, res) => {
       req.write(opts.body);
       req.end();
     });
-
     res.json(response);
   } catch (error) {
     console.error('Error fetching user info:', error);
@@ -359,7 +379,7 @@ app.get('/user-info', validateToken, async (req, res) => {
 app.post('/recover', async (req, res) => {
   const { username } = req.body;
   const opts = {
-    host: `cognito-idp.${process.env.COGNITO_REGION}.amazonaws.com`,
+    host: COGNITO_IDP_HOST,
     path: '/',
     method: 'POST',
     headers: {
@@ -371,12 +391,7 @@ app.post('/recover', async (req, res) => {
       Username: username,
     }),
   };
-
-  aws4.sign(opts, {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  });
-
+  aws4.sign(opts, { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY });
   try {
     const response = await new Promise((resolve, reject) => {
       const req = https.request(opts, (res) => {
@@ -398,15 +413,11 @@ app.post('/recover', async (req, res) => {
 // Start the server after initialization
 const PORT = process.env.PORT || 80;
 Promise.all([initializeSchema(), ensureProPlanPrice(), ensureWebhookEndpoint()])
-  .then(([_, priceId, webhookSecret]) => {
-    process.env.STRIPE_PRO_PLAN_PRICE_ID = priceId;
-    if (webhookSecret) {
-      process.env.STRIPEWEBHOOK_SIGNING_SECRET = webhookSecret;
-    } else if (!process.env.STRIPEWEBHOOK_SIGNING_SECRET) {
-      throw new Error('STRIPEWEBHOOK_SIGNING_SECRET not set and could not be retrieved');
-    }
+  .then(([_, priceId, secret]) => {
+    proPlanPriceId = priceId;
+    webhookSecret = secret;
     app.listen(PORT, () => {
-      console.log(`Backend server running at https://backend.hello-world.local.codelifted.com:${PORT}`);
+      console.log(`Backend server running at ${SERVER_BASE_URL}:${PORT}`);
     });
   })
   .catch((err) => {

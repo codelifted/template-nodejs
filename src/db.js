@@ -14,7 +14,7 @@ const pool = new Pool({
 async function initializeSchema() {
   const client = await pool.connect();
   try {
-    // Users table with Stripe-related fields
+    // Users table
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -25,7 +25,7 @@ async function initializeSchema() {
       );
     `);
 
-    // Projects table (unchanged)
+    // Projects table
     await client.query(`
       CREATE TABLE IF NOT EXISTS projects (
         id SERIAL PRIMARY KEY,
@@ -34,21 +34,29 @@ async function initializeSchema() {
       );
     `);
 
-    // Stripe events table for webhook event logging
+    // Stripe events table
     await client.query(`
       CREATE TABLE IF NOT EXISTS stripe_events (
         id SERIAL PRIMARY KEY,
         event_type VARCHAR(255) NOT NULL,
         event_data JSONB NOT NULL,
-        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL TELEPATHY,
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Config table for storing webhook secret
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS config (
+        key VARCHAR(255) PRIMARY KEY,
+        stripe_webhook_secret VARCHAR(255) NOT NULL
       );
     `);
 
     console.log('Database schema initialized successfully');
   } catch (error) {
     console.error('Error initializing schema:', error);
-    throw error; // Re-throw to halt startup if schema creation fails
+    throw error;
   } finally {
     client.release();
   }
